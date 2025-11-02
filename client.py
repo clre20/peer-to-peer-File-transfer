@@ -13,14 +13,15 @@ class P2PClientApp:
     SIGNALING_SERVER_HOST = "clre20.ggff.net"
     API_ENDPOINT = "/api/server-info"
     LISTEN_PORT = 50000
-    REGISTRATION_INTERVAL = 30
+    REGISTRATION_INTERVAL = 20  # 縮短到 20 秒，保持 NAT 映射
     BUFFER_SIZE = 1024
     MAX_HTTPS_RETRY = 3
     ID_FILE = "peer_id.txt"
 
     def __init__(self, root):
+        self.registration_seq = 0
         self.root = root
-        self.root.title("P2P 客戶端 (註冊三態 + 點擊重試)")
+        self.root.title("P2P 客戶端 (穩定續約 + 防卡死)")
         self.root.geometry("700x750")
 
         self.peer_id = self._load_or_generate_peer_id()
@@ -29,7 +30,7 @@ class P2PClientApp:
         self.public_ip = "N/A"
         self.public_port = 0
         self.is_registered = False
-        self.registration_in_progress = False  # 防止重複發送
+        self.registration_in_progress = False
 
         self.active_peers = {}
         self.udp_socket = None
@@ -109,11 +110,9 @@ class P2PClientApp:
         self.server_input.config(state='readonly')
         self.server_input.pack(side='left', padx=5, fill='x', expand=True)
 
-        # 點擊重試按鈕
         self.connect_button = tk.Button(frame_conn, text="開始註冊", command=self.manual_retry)
         self.connect_button.pack(side='left', padx=5)
 
-        # 狀態標籤（可點擊）
         self.status_label = tk.Label(frame_conn, text="狀態: 初始化中...", fg='gray', font=('Arial', 10, 'bold'), cursor="hand2")
         self.status_label.pack(side='left', padx=10)
         self.status_label.bind("<Button-1>", lambda e: self.manual_retry())
@@ -159,7 +158,6 @@ class P2PClientApp:
         self.log_area.see(tk.END)
 
     def set_status(self, text, color, button_text=None, button_state='disabled'):
-        """統一更新狀態 + 按鈕"""
         def update():
             self.status_label.config(text=text, fg=color)
             if button_text is not None:
@@ -167,16 +165,17 @@ class P2PClientApp:
         self.root.after(0, update)
 
     # ==================================================================
-    # 4. UDP 監聽
+    # 4. UDP 監聽（防卡死 + 超時）
     # ==================================================================
     def init_udp_socket(self):
         try:
             self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.udp_socket.bind(('0.0.0.0', self.LISTEN_PORT))
+            self.udp_socket.settimeout(1.0)  # 關鍵：recvfrom 超時 1 秒
             self.listener_thread = threading.Thread(target=self._udp_listener, daemon=True)
             self.listener_thread.start()
-            self.log(f"UDP 監聽啟動於埠 {self.LISTEN_PORT}", 'green')
+            self.log(f"UDP 監聽啟動於埠 {self.LISTEN_PORT} (超時: 1s)", 'green')
             return True
         except Exception as e:
             self.log(f"UDP 初始化失敗: {e}", 'red')
@@ -219,49 +218,58 @@ class P2PClientApp:
                     self.log(f"打洞成功！可直連 {addr[0]}:{addr[1]}", 'blue')
 
                 elif t == "MSG":
-                    self.log(f"P2P 訊息 ← {msg.get('sender_id')}: {msg.get('content')}", 'blue')
+                    sender = msg.get('sender_id', '未知')
+                    content = msg.get('content', '')
+                    self.log(f"P2P 訊息 ← {sender}: {content}", 'blue')
 
-            except:
+            except socket.timeout:
+                continue  # 超時就跳過，繼續監聽
+            except json.JSONDecodeError:
+                continue
+            except Exception as e:
+                self.log(f"UDP 接收錯誤: {e}", 'red')
                 continue
 
     # ==================================================================
-    # 5. 註冊流程（三態）
+    # 5. 註冊流程（防靜默失敗）
     # ==================================================================
     def register(self):
-        if self.registration_in_progress:
-            return
-        self.registration_in_progress = True
+        current_seq = self.registration_seq
+        self.registration_seq += 1
 
         self.set_status("狀態: 註冊中...", 'orange', "註冊中...", 'disabled')
-        self.send_udp({
-            "type": "register",
-            "id": self.peer_id
-        })
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.log(
-            f"發送註冊請求 → ID: {self.peer_id} | "
-            f"伺服器: {self.signaling_ip}:{self.signaling_port} | "
-            f"時間: {timestamp}",
-            'orange'
-        )
 
-        # 設定超時：10 秒未成功 → 視為失敗
-        def timeout_check():
-            time.sleep(10)
-            if self.registration_in_progress and not self.is_registered:
-                self.registration_in_progress = False
-                self.set_status("狀態: 註冊失敗 (點擊重試)", 'red', "點擊重試", 'normal')
-                self.log("註冊超時，視為失敗", 'red')
-        threading.Thread(target=timeout_check, daemon=True).start()
-
-    def send_udp(self, msg):
-        if not self.signaling_ip:
+        if self.send_udp({"type": "register", "id": self.peer_id}):
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.log(f"發送註冊請求 (seq={current_seq}) → ID: {self.peer_id} | 時間: {timestamp}", 'orange')
+        else:
+            self.set_status("狀態: 發送失敗", 'red', "點擊重試", 'normal')
             return
+
+        def timeout_check():
+            time.sleep(5)
+            # 只有這個 seq 還在進行中，才處理
+            if self.registration_seq - 1 == current_seq and not self.is_registered:
+                self.set_status("狀態: 註冊超時 (自動重試中...)", 'orange', "自動重試中...", 'disabled')
+                self.log(f"註冊超時 (seq={current_seq})，自動重試...", 'orange')
+                self.root.after(100, self.register)
+
+        threading.Thread(target=timeout_check, daemon=True).start()
+    
+    def send_udp(self, msg):
+        if not self.signaling_ip or not self.udp_socket:
+            self.log("UDP 未初始化，無法發送", 'red')
+            return False
         try:
             data = json.dumps(msg).encode('utf-8')
-            self.udp_socket.sendto(data, (self.signaling_ip, self.signaling_port))
+            bytes_sent = self.udp_socket.sendto(data, (self.signaling_ip, self.signaling_port))
+            if bytes_sent != len(data):
+                self.log(f"UDP 發送不完整: {bytes_sent}/{len(data)} bytes", 'red')
+                return False
+            return True
         except Exception as e:
-            self.log(f"發送失敗: {e}", 'red')
+            self.log(f"UDP 發送失敗: {e}", 'red')
+            return False
 
     # ==================================================================
     # 6. 自動續約 + 手動重試
@@ -269,7 +277,7 @@ class P2PClientApp:
     def start_auto_registration(self):
         def loop():
             while True:
-                if not self.is_registered and not self.registration_in_progress:
+                if not self.registration_in_progress:
                     self.register()
                 time.sleep(self.REGISTRATION_INTERVAL)
         threading.Thread(target=loop, daemon=True).start()
@@ -284,7 +292,7 @@ class P2PClientApp:
         self.register()
 
     # ==================================================================
-    # 7. 其他功能（打洞、訊息、UI）
+    # 7. 其他功能
     # ==================================================================
     def request_peers(self):
         self.send_udp({"type": "get_peers", "requester_id": self.peer_id})
