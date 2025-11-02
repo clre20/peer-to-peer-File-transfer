@@ -20,6 +20,7 @@ class P2PClientApp:
 
     def __init__(self, root):
         self.registration_seq = 0
+        self.pending_punch = None 
         self.root = root
         self.root.title("P2P 客戶端 (穩定續約 + 防卡死)")
         self.root.geometry("700x750")
@@ -211,12 +212,21 @@ class P2PClientApp:
                     threading.Thread(target=self._initiate_hole_punching, args=(tid, ip, port), daemon=True).start()
 
                 elif t == "HOLE_PUNCH":
-                    self.log(f"收到打洞 ← {addr[0]}:{addr[1]}", 'purple')
+                    sender_id = msg.get('sender_id', '未知')
+                    self.log(f"收到打洞 ← {addr[0]}:{addr[1]} (ID: {sender_id})", 'purple')
                     self._send_punch_ack(addr[0], addr[1])
-
-                elif t == "PUNCH_ACK":
                     self.log(f"打洞成功！可直連 {addr[0]}:{addr[1]}", 'blue')
-
+                    self.root.after(0, self.selected_peer_info.config, 
+                    {'text': f"已直連 {addr[0]}:{addr[1]}", 'fg': 'green'})
+    
+                elif t == "PUNCH_ACK":
+                    sender_id = msg.get('sender_id', '未知')
+                    self.log(f"收到 PUNCH_ACK ← {addr[0]}:{addr[1]} (ID: {sender_id})", 'blue')
+                    if self.pending_punch and self.pending_punch[1:] == (addr[0], addr[1]):
+                        self.log(f"打洞成功！可直連 {addr[0]}:{addr[1]}", 'blue')
+                        self.root.after(0, self.selected_peer_info.config, 
+                        {'text': f"已直連 {addr[0]}:{addr[1]}", 'fg': 'green'})
+                        self.pending_punch = None
                 elif t == "MSG":
                     sender = msg.get('sender_id', '未知')
                     content = msg.get('content', '')
@@ -303,15 +313,33 @@ class P2PClientApp:
 
     def _initiate_hole_punching(self, target_id, ip, port):
         self.log(f"打洞中 → {target_id} ({ip}:{port})", 'purple')
+        self.pending_punch = (target_id, ip, port)
+    
         msg = json.dumps({"type": "HOLE_PUNCH", "sender_id": self.peer_id}).encode('utf-8')
         for _ in range(5):
             self.udp_socket.sendto(msg, (ip, port))
             time.sleep(0.1)
-        self.log(f"已發送 5 次打洞包", 'purple')
+    
+        self.log(f"已發送 5 次打洞包，等待回應...", 'purple')
+    
+        def check_timeout():
+            time.sleep(3)
+            if self.pending_punch and self.pending_punch[0] == target_id:
+                self.log(f"打洞失敗：{target_id} 無回應", 'red')
+                self.root.after(0, self.selected_peer_info.config, 
+                                {'text': "打洞失敗", 'fg': 'red'})
+                self.pending_punch = None
+    
+        threading.Thread(target=check_timeout, daemon=True).start()
 
     def _send_punch_ack(self, ip, port):
-        self.udp_socket.sendto(json.dumps({"type": "PUNCH_ACK", "sender_id": self.peer_id}).encode('utf-8'), (ip, port))
-
+        msg = json.dumps({"type": "PUNCH_ACK", "sender_id": self.peer_id}).encode('utf-8')
+        try:
+            self.udp_socket.sendto(msg, (ip, port))
+            self.log(f"已回應 PUNCH_ACK → {ip}:{port}", 'blue')
+        except Exception as e:
+            self.log(f"PUNCH_ACK 發送失敗: {e}", 'red')
+    
     def send_p2p_message_ui(self):
         if not self.is_registered:
             messagebox.showwarning("未註冊", "請先註冊成功")
