@@ -22,7 +22,7 @@ class P2PClientApp:
         self.registration_seq = 0
         self.pending_punch = None 
         self.root = root
-        self.root.title("P2P 客戶端 (穩定續約 + 防卡死)")
+        self.root.title("P2P 客戶端 (穩定續約 + 延遲打洞)")
         self.root.geometry("700x750")
 
         self.peer_id = self._load_or_generate_peer_id()
@@ -33,7 +33,11 @@ class P2PClientApp:
         self.is_registered = False
         self.registration_in_progress = False
 
-        self.active_peers = {}
+        self.active_peers = {}           # 伺服器回報的 Peer 列表 {id: {ip, port}}
+        self.p2p_connections = {}        # 已建立的 P2P 通道 {id: (ip, port)}
+        self.pending_message = {}        # 快取的待發訊息 {id: "message"}
+        self.selected_target_id = None   # UI 選擇的目標
+        
         self.udp_socket = None
         self.listener_thread = None
 
@@ -127,22 +131,25 @@ class P2PClientApp:
 
         frame_peers = tk.Frame(self.root, padx=10, pady=5, bd=1, relief=tk.GROOVE)
         frame_peers.pack(fill='x', pady=5)
-        tk.Label(frame_peers, text="活躍客戶端 ID (點擊發起打洞):", font=('Arial', 10, 'bold')).pack(anchor='w', pady=5)
+        tk.Label(frame_peers, text="活躍客戶端 ID (點擊選擇目標):", font=('Arial', 10, 'bold')).pack(anchor='w', pady=5)
         self.peer_list_box = tk.Listbox(frame_peers, height=6, font=('Courier', 10))
         self.peer_list_box.pack(fill='x', expand=True)
-        self.peer_list_box.bind('<<ListboxSelect>>', self.initiate_hole_punching_ui)
-        self.selected_peer_info = tk.Label(frame_peers, text="[選定 Peer P2P 資訊: N/A]", fg='blue', font=('Arial', 10))
+        self.peer_list_box.bind('<<ListboxSelect>>', self.on_peer_select)
+        self.selected_peer_info = tk.Label(frame_peers, text="[尚未選擇目標]", fg='gray', font=('Arial', 10))
         self.selected_peer_info.pack(anchor='w', pady=(5, 0))
 
         frame_send = tk.Frame(self.root, padx=10, pady=5, bd=1, relief=tk.GROOVE)
         frame_send.pack(fill='x', pady=5)
         self.message_input = tk.Entry(frame_send, width=40)
         self.message_input.pack(side='left', padx=5, fill='x', expand=True)
-        tk.Button(frame_send, text="發送 P2P 訊息", command=self.send_p2p_message_ui).pack(side='left', padx=5)
+        # *** 修改點：更新按鈕文字 ***
+        tk.Button(frame_send, text="發送 (建立連線)", command=self.send_p2p_message_ui).pack(side='left', padx=5)
 
         frame_log = tk.Frame(self.root, padx=10, pady=5)
         frame_log.pack(fill='both', expand=True)
         tk.Label(frame_log, text="通信日誌:", font=('Arial', 10, 'bold')).pack(anchor='w', pady=(0, 5))
+        # *** 修改點：增加防火牆提示 ***
+        tk.Label(frame_log, text="提示: 若打洞失敗，請檢查本地防火牆是否允許 Python 或 UDP 50000 埠", fg='gray', font=('Arial', 8)).pack(anchor='w')
         self.log_area = scrolledtext.ScrolledText(frame_log, height=15, state='disabled', font=('Arial', 10))
         self.log_area.pack(fill='both', expand=True)
 
@@ -211,26 +218,49 @@ class P2PClientApp:
                     self.log(f"開始打洞 → {tid} ({ip}:{port})", 'purple')
                     threading.Thread(target=self._initiate_hole_punching, args=(tid, ip, port), daemon=True).start()
 
+                # *** 修改點：收到打洞請求，建立 P2P 連線並檢查快取 ***
                 elif t == "HOLE_PUNCH":
                     sender_id = msg.get('sender_id', '未知')
                     self.log(f"收到打洞 ← {addr[0]}:{addr[1]} (ID: {sender_id})", 'purple')
                     self._send_punch_ack(addr[0], addr[1])
+
+                    # 儲存 P2P 連線
+                    self.p2p_connections[sender_id] = (addr[0], addr[1])
                     self.log(f"打洞成功！可直連 {addr[0]}:{addr[1]}", 'blue')
-                    self.root.after(0, self.selected_peer_info.config, 
-                    {'text': f"已直連 {addr[0]}:{addr[1]}", 'fg': 'green'})
+                    
+                    # 更新 UI
+                    if self.selected_target_id == sender_id:
+                        self.root.after(0, self.selected_peer_info.config, 
+                        {'text': f"已直連 {addr[0]}:{addr[1]}", 'fg': 'green'})
+                    
+                    # 檢查並發送快取訊息
+                    self._check_and_send_pending_message(sender_id, (addr[0], addr[1]))
     
+                # *** 修改點：收到打洞回應，建立 P2P 連線並檢查快取 ***
                 elif t == "PUNCH_ACK":
                     sender_id = msg.get('sender_id', '未知')
                     self.log(f"收到 PUNCH_ACK ← {addr[0]}:{addr[1]} (ID: {sender_id})", 'blue')
-                    if self.pending_punch and self.pending_punch[1:] == (addr[0], addr[1]):
+                    
+                    # 儲存 P2P 連線
+                    self.p2p_connections[sender_id] = (addr[0], addr[1])
+                    
+                    if self.pending_punch and self.pending_punch[0] == sender_id:
                         self.log(f"打洞成功！可直連 {addr[0]}:{addr[1]}", 'blue')
-                        self.root.after(0, self.selected_peer_info.config, 
-                        {'text': f"已直連 {addr[0]}:{addr[1]}", 'fg': 'green'})
+                        
+                        # 更新 UI
+                        if self.selected_target_id == sender_id:
+                            self.root.after(0, self.selected_peer_info.config, 
+                            {'text': f"已直連 {addr[0]}:{addr[1]}", 'fg': 'green'})
+                        
                         self.pending_punch = None
+                        
+                        # 檢查並發送快取訊息
+                        self._check_and_send_pending_message(sender_id, (addr[0], addr[1]))
+
                 elif t == "MSG":
                     sender = msg.get('sender_id', '未知')
                     content = msg.get('content', '')
-                    self.log(f"P2P 訊息 ← {sender}: {content}", 'blue')
+                    self.log(f"P2P 訊息 ← {sender} (來自 {addr[0]}:{addr[1]}): {content}", 'blue')
 
             except socket.timeout:
                 continue  # 超時就跳過，繼續監聽
@@ -302,17 +332,20 @@ class P2PClientApp:
         self.register()
 
     # ==================================================================
-    # 7. 其他功能
+    # 7. P2P 流程（打洞 + 發送）
     # ==================================================================
     def request_peers(self):
         self.send_udp({"type": "get_peers", "requester_id": self.peer_id})
 
     def request_connect(self, target_id):
         self.send_udp({"type": "connect", "id": self.peer_id, "target_id": target_id})
-        self.log(f"請求連線 → {target_id}", 'purple')
+        self.log(f"請求交換位址 → {target_id}", 'purple')
+        self.root.after(0, self.selected_peer_info.config, 
+                                {'text': f"正在請求 {target_id} 位址...", 'fg': 'orange'})
 
     def _initiate_hole_punching(self, target_id, ip, port):
-        self.log(f"打洞中 → {target_id} ({ip}:{port})", 'purple')
+        # *** 修改點：增加 Symmetric NAT 提示 ***
+        self.log(f"打洞中 (Symmetric NAT 可能失敗) → {target_id} ({ip}:{port})", 'purple')
         self.pending_punch = (target_id, ip, port)
     
         msg = json.dumps({"type": "HOLE_PUNCH", "sender_id": self.peer_id}).encode('utf-8')
@@ -325,9 +358,11 @@ class P2PClientApp:
         def check_timeout():
             time.sleep(3)
             if self.pending_punch and self.pending_punch[0] == target_id:
-                self.log(f"打洞失敗：{target_id} 無回應", 'red')
-                self.root.after(0, self.selected_peer_info.config, 
-                                {'text': "打洞失敗", 'fg': 'red'})
+                # *** 修改點：增加失敗原因提示 ***
+                self.log(f"打洞失敗：{target_id} 無回應 (可能是 Symmetric NAT 或防火牆)", 'red')
+                if self.selected_target_id == target_id:
+                    self.root.after(0, self.selected_peer_info.config, 
+                                    {'text': "打洞失敗 (NAT 或防火牆)", 'fg': 'red'})
                 self.pending_punch = None
     
         threading.Thread(target=check_timeout, daemon=True).start()
@@ -339,36 +374,78 @@ class P2PClientApp:
             self.log(f"已回應 PUNCH_ACK → {ip}:{port}", 'blue')
         except Exception as e:
             self.log(f"PUNCH_ACK 發送失敗: {e}", 'red')
+
+    # *** 新增：內部 P2P 訊息發送函數 ***
+    def _send_p2p_message_internal(self, target_id, content, address):
+        """使用指定的 P2P 位址發送訊息"""
+        try:
+            msg = json.dumps({"type": "MSG", "sender_id": self.peer_id, "content": content}).encode('utf-8')
+            self.udp_socket.sendto(msg, address)
+            self.log(f"P2P 訊息 → {target_id} (at {address[0]}:{address[1]}): {content}", 'blue')
+        except Exception as e:
+            self.log(f"P2P 訊息發送失敗: {e}", 'red')
+
+    # *** 新增：檢查並發送快取訊息 ***
+    def _check_and_send_pending_message(self, sender_id, address):
+        """檢查是否有待發訊息，如果有，就發送"""
+        if sender_id in self.pending_message:
+            content = self.pending_message.pop(sender_id)
+            self.log(f"連線成功，發送快取訊息 → {sender_id}", 'green')
+            self._send_p2p_message_internal(sender_id, content, address)
     
+    # *** 修改點：UI 發送按鈕的邏輯 ***
     def send_p2p_message_ui(self):
         if not self.is_registered:
             messagebox.showwarning("未註冊", "請先註冊成功")
             return
-        try:
-            target_id = self.peer_list_box.get(self.peer_list_box.curselection()[0])
-        except:
-            messagebox.showwarning("未選擇", "請選擇目標")
+            
+        # 1. 檢查是否已從列表選擇目標
+        if not self.selected_target_id:
+            messagebox.showwarning("未選擇", "請先從列表中點擊一個目標")
             return
+            
+        target_id = self.selected_target_id
         content = self.message_input.get().strip()
         if not content:
             return
-        peer = self.active_peers.get(target_id)
-        if not peer:
-            return
-        msg = json.dumps({"type": "MSG", "sender_id": self.peer_id, "content": content}).encode('utf-8')
-        self.udp_socket.sendto(msg, (peer['ip'], peer['port']))
-        self.log(f"P2P 訊息 → {target_id}: {content}", 'blue')
-        self.message_input.delete(0, tk.END)
+            
+        # 2. 檢查 P2P 通道是否已建立
+        if target_id in self.p2p_connections:
+            # 情況 A：通道已建立，直接發送
+            address = self.p2p_connections[target_id]
+            self.log(f"使用已建立的 P2P 通道發送...", 'green')
+            self._send_p2p_message_internal(target_id, content, address)
+            self.message_input.delete(0, tk.END)
+        else:
+            # 情況 B：通道未建立，快取訊息並開始打洞
+            self.pending_message[target_id] = content
+            self.log(f"快取訊息: '{content}'", 'green')
+            self.log(f"P2P 通道未建立，自動請求連線 → {target_id}", 'purple')
+            
+            # 觸發打洞流程
+            self.request_connect(target_id)
+            self.message_input.delete(0, tk.END)
 
-    def initiate_hole_punching_ui(self, event):
+    # *** 修改點：UI 列表選擇的邏輯 ***
+    def on_peer_select(self, event):
+        """當使用者點擊 Listbox 時觸發"""
         try:
             target_id = self.peer_list_box.get(self.peer_list_box.curselection()[0])
-            peer = self.active_peers.get(target_id)
-            if peer:
-                self.selected_peer_info.config(text=f"連線資訊: {peer['ip']}:{peer['port']}", fg='blue')
-                self.request_connect(target_id)
+            self.selected_target_id = target_id
+            
+            # 更新 UI 標籤，顯示 P2P 狀態
+            if target_id in self.p2p_connections:
+                addr = self.p2p_connections[target_id]
+                self.selected_peer_info.config(text=f"已直連: {addr[0]}:{addr[1]}", fg='green')
+            elif target_id in self.active_peers:
+                peer_info = self.active_peers.get(target_id)
+                self.selected_peer_info.config(text=f"選定 (公網): {peer_info['ip']}:{peer_info['port']}", fg='blue')
+            else:
+                self.selected_peer_info.config(text="[選定 Peer 資訊: N/A]", fg='red')
+                self.selected_target_id = None
         except:
-            self.selected_peer_info.config(text="[選定 Peer P2P 資訊: N/A]", fg='red')
+            self.selected_peer_info.config(text="[尚未選擇目標]", fg='gray')
+            self.selected_target_id = None
 
     def _update_peer_list_box(self):
         self.peer_list_box.delete(0, tk.END)
